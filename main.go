@@ -522,7 +522,7 @@ func runInstallerLogic(opts LaunchOptions, label *widget.Label, cLoader fyne.Can
 	stopAnimation := make(chan bool, 1)
 	isAnimating := true
 
-	fyne.Do(func() {
+	fyne.Do(func() { // Had to add this to prevent verbose errors
 		track.Move(fyne.NewPos(0, 0))
 		track.Resize(fyne.NewSize(loaderWidth, 8))
 		track.Refresh()
