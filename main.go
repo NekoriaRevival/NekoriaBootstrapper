@@ -175,7 +175,9 @@ func createCustomLoader() (fyne.CanvasObject, *canvas.Rectangle, *canvas.Rectang
 func animateIndeterminate(chunk *canvas.Rectangle, totalWidth float32, stop chan bool, wg *sync.WaitGroup) {
 	defer wg.Done()
 	chunkWidth := float32(80)
-	chunk.Resize(fyne.NewSize(chunkWidth, 8))
+	fyne.Do(func() {
+		chunk.Resize(fyne.NewSize(chunkWidth, 8))
+	})
 	var xPos float32 = -chunkWidth
 	for {
 		select {
@@ -186,7 +188,10 @@ func animateIndeterminate(chunk *canvas.Rectangle, totalWidth float32, stop chan
 			if xPos > totalWidth {
 				xPos = -chunkWidth
 			}
-			chunk.Move(fyne.NewPos(xPos, 0))
+			position := fyne.NewPos(xPos, 0)
+			fyne.Do(func() {
+				chunk.Move(position)
+			})
 			time.Sleep(16 * time.Millisecond)
 		}
 	}
@@ -517,20 +522,26 @@ func runInstallerLogic(opts LaunchOptions, label *widget.Label, cLoader fyne.Can
 	stopAnimation := make(chan bool, 1)
 	isAnimating := true
 
-	track.Move(fyne.NewPos(0, 0))
-	track.Resize(fyne.NewSize(loaderWidth, 8))
-	track.Refresh()
+	fyne.Do(func() { // Had to add this to prevent verbose errors
+		track.Move(fyne.NewPos(0, 0))
+		track.Resize(fyne.NewSize(loaderWidth, 8))
+		track.Refresh()
+	})
 
 	wg.Add(1)
 	go animateIndeterminate(chunk, loaderWidth, stopAnimation, &wg)
 
 	appDir, err := getAppDir()
 	if err != nil {
-		label.SetText(fmt.Sprintf("Error: %v", err))
+		fyne.Do(func() {
+			label.SetText(fmt.Sprintf("Error: %v", err))
+		})
 		return
 	}
 
-	label.SetText("Checking for client installation...")
+	fyne.Do(func() {
+		label.SetText("Checking for client installation...")
+	})
 
 	var progressMu sync.Mutex
 	progressCallback := func(msg string, progress float32) {
@@ -546,23 +557,27 @@ func runInstallerLogic(opts LaunchOptions, label *widget.Label, cLoader fyne.Can
 			isAnimating = false
 		}
 
-		label.SetText(msg)
-		track.Move(fyne.NewPos(0, 0))
-		track.Resize(fyne.NewSize(loaderWidth, 8))
-		track.Refresh()
 		if progress < 0 {
 			progress = 0
 		}
 		if progress > 1 {
 			progress = 1
 		}
-		chunk.Resize(fyne.NewSize(loaderWidth*progress, 8))
-		chunk.Move(fyne.NewPos(0, 0))
-		chunk.Refresh()
+		fyne.Do(func() {
+			label.SetText(msg)
+			track.Move(fyne.NewPos(0, 0))
+			track.Resize(fyne.NewSize(loaderWidth, 8))
+			track.Refresh()
+			chunk.Resize(fyne.NewSize(loaderWidth*progress, 8))
+			chunk.Move(fyne.NewPos(0, 0))
+			chunk.Refresh()
+		})
 	}
 
 	if err := checkAndInstallClient(appDir, progressCallback); err != nil {
-		label.SetText(fmt.Sprintf("Failed to install client: %v", err))
+		fyne.Do(func() {
+			label.SetText(fmt.Sprintf("Failed to install client: %v", err))
+		})
 		if isAnimating {
 			select {
 			case stopAnimation <- true:
@@ -576,9 +591,11 @@ func runInstallerLogic(opts LaunchOptions, label *widget.Label, cLoader fyne.Can
 	if !isAnimating {
 		isAnimating = true
 		stopAnimation = make(chan bool, 1)
-		track.Move(fyne.NewPos(0, 0))
-		track.Resize(fyne.NewSize(loaderWidth, 8))
-		track.Refresh()
+		fyne.Do(func() {
+			track.Move(fyne.NewPos(0, 0))
+			track.Resize(fyne.NewSize(loaderWidth, 8))
+			track.Refresh()
+		})
 		wg.Add(1)
 		go animateIndeterminate(chunk, loaderWidth, stopAnimation, &wg)
 	}
@@ -593,9 +610,13 @@ func runInstallerLogic(opts LaunchOptions, label *widget.Label, cLoader fyne.Can
 	}
 
 	if opts.LaunchMode == "play" {
-		label.SetText("Starting Nekoria...")
+		fyne.Do(func() {
+			label.SetText("Starting Nekoria...")
+		})
 		if err := launchClient(appDir, opts); err != nil {
-			label.SetText(fmt.Sprintf("Failed to launch: %v", err))
+			fyne.Do(func() {
+				label.SetText(fmt.Sprintf("Failed to launch: %v", err))
+			})
 			if isAnimating {
 				select {
 				case stopAnimation <- true:
@@ -618,15 +639,19 @@ func runInstallerLogic(opts LaunchOptions, label *widget.Label, cLoader fyne.Can
 	}
 
 	if opts.LaunchMode != "play" {
-		label.SetText("Nekoria is ready!")
-		cLoader.Hide()
-		btn.SetText("Finish")
-		btn.OnTapped = func() { win.Close() }
-		btn.Refresh()
+		fyne.Do(func() {
+			label.SetText("Nekoria is ready!")
+			cLoader.Hide()
+			btn.SetText("Finish")
+			btn.OnTapped = func() { win.Close() }
+			btn.Refresh()
+		})
 	} else {
 		go func() {
 			time.Sleep(5 * time.Second)
-			win.Close()
+			fyne.Do(func() {
+				win.Close()
+			})
 		}()
 	}
 }
