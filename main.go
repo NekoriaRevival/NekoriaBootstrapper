@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	_ "embed"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"image/color"
 	"io"
@@ -37,11 +38,10 @@ import (
 var logoBytes []byte
 
 const (
-	setupURL       = "setup.nekoria.pl"
-	baseURL        = "nekoria.pl"
-	appName        = "Nekoria"
-	protocolScheme = "nekoria-player"
-	authURLDefault = "http://www.nekoria.pl/Login/Negotiate.ashx"
+	setupURL            = "setup.nekoria.pl"
+	appName             = "Nekoria"
+	protocolScheme      = "nekoria-player"
+	bootstrapperVersion = "2.0"
 )
 
 var setupHTTPClient = &http.Client{
@@ -280,6 +280,52 @@ func parseCommandLineArgs(args []string) (LaunchOptions, error) {
 	return opts, nil
 }
 
+type clientPlatform struct {
+	Key string
+	Exe string
+}
+
+var (
+	platformWindows = clientPlatform{Key: "Windows", Exe: "NekoriaPlayerWin.exe"}
+	platformFreeBSD = clientPlatform{Key: "FreeBSD", Exe: "NekoriaPlayer"}
+	platformMusl    = clientPlatform{Key: "Linux-musl", Exe: "NekoriaPlayer"}
+	platformGlibc   = clientPlatform{Key: "Linux-glibc", Exe: "NekoriaPlayer"}
+)
+
+func detectClientPlatform() (clientPlatform, error) {
+	switch runtime.GOOS {
+	case "windows":
+		return platformWindows, nil
+	case "freebsd":
+		return platformFreeBSD, nil
+	case "linux":
+		if linuxIsMusl() {
+			return platformMusl, nil
+		}
+		return platformGlibc, nil
+	default:
+		return clientPlatform{}, fmt.Errorf("unsupported platform: %s", runtime.GOOS)
+	}
+}
+
+func linuxIsMusl() bool {
+	if b, err := os.ReadFile("/proc/self/maps"); err == nil {
+		if strings.Contains(string(b), "ld-musl-") {
+			return true
+		}
+		if strings.Contains(string(b), "ld-linux-") {
+			return false
+		}
+	}
+	if m, err := filepath.Glob("/lib/ld-musl-*.so.1"); err == nil && len(m) > 0 {
+		return true
+	}
+	if m, err := filepath.Glob("/usr/lib/ld-musl-*.so.1"); err == nil && len(m) > 0 {
+		return true
+	}
+	return false
+}
+
 func getLatestClientVersion() (string, error) {
 	resp, err := setupHTTPClient.Get(fmt.Sprintf("https://%s/version", setupURL))
 	if err != nil {
@@ -299,6 +345,102 @@ func getLatestClientVersion() (string, error) {
 	return strings.TrimSpace(string(body)), nil
 }
 
+func getLatestBootstrapperVersion() (string, error) {
+	resp, err := setupHTTPClient.Get(fmt.Sprintf("https://%s/bootstrapperversion", setupURL))
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch bootstrapper version: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("server returned status: %s", resp.Status)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	return strings.TrimSpace(string(body)), nil
+}
+
+func shouldSelfUpdate(local, remote string) bool {
+	return remote != "" && local != remote
+}
+
+func bootstrapArtifactName(plat clientPlatform) string {
+	if plat.Key == platformWindows.Key {
+		return "NekoriaBootstrapper.exe"
+	}
+	return "NekoriaBootstrapper-" + plat.Key
+}
+
+func maybeSelfUpdate(plat clientPlatform) error {
+	remote, err := getLatestBootstrapperVersion()
+	if err != nil {
+		return err
+	}
+	if !shouldSelfUpdate(bootstrapperVersion, remote) {
+		return nil
+	}
+
+	exePath, err := os.Executable()
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Bootstrapper update available: %s -> %s\n", bootstrapperVersion, remote)
+
+	tmpPath := exePath + ".new"
+	newFile, err := os.Create(tmpPath)
+	if err != nil {
+		return err
+	}
+
+	resp, err := setupHTTPClient.Get(fmt.Sprintf("https://%s/%s", setupURL, bootstrapArtifactName(plat)))
+	if err != nil {
+		newFile.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("failed to download update: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		newFile.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("update download returned status: %s", resp.Status)
+	}
+
+	_, err = io.Copy(newFile, resp.Body)
+	newFile.Close()
+	if err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+
+	if runtime.GOOS != "windows" {
+		os.Chmod(tmpPath, 0755)
+		if err := os.Rename(tmpPath, exePath); err != nil {
+			os.Remove(tmpPath)
+			return err
+		}
+	} else {
+		oldPath := exePath + ".old"
+		os.Remove(oldPath)
+		if err := os.Rename(exePath, oldPath); err != nil {
+			os.Remove(tmpPath)
+			return err
+		}
+		if err := os.Rename(tmpPath, exePath); err != nil {
+			os.Remove(tmpPath)
+			return err
+		}
+	}
+
+	fmt.Printf("Bootstrapper updated to %s\n", remote)
+	return nil
+}
+
 func getSHA1Hash(path string) (string, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -314,7 +456,7 @@ func getSHA1Hash(path string) (string, error) {
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
-func checkAndInstallClient(appDir string, onProgress func(string, float32)) error {
+func checkAndInstallClient(appDir string, plat clientPlatform, onProgress func(string, float32)) error {
 	onProgress("Fetching latest client version...", 0)
 
 	latestVersion, err := getLatestClientVersion()
@@ -363,7 +505,7 @@ func checkAndInstallClient(appDir string, onProgress func(string, float32)) erro
 	if !needsInstall {
 		for _, year := range clientYears {
 			clientDir := filepath.Join(currentVersionDir, fmt.Sprintf("Client%s", year))
-			exePath := filepath.Join(clientDir, "NekoriaPlayerBeta.exe")
+			exePath := filepath.Join(clientDir, plat.Exe)
 
 			if _, err := os.Stat(exePath); os.IsNotExist(err) {
 				needsInstall = true
@@ -405,9 +547,9 @@ func checkAndInstallClient(appDir string, onProgress func(string, float32)) erro
 		baseProgress := float32(i) / float32(totalClients)
 		clientProgress := 1.0 / float32(totalClients)
 
-		onProgress(fmt.Sprintf("Downloading %s client...", year), baseProgress)
+		onProgress(fmt.Sprintf("Downloading %s client (%s)...", year, plat.Key), baseProgress)
 
-		downloadURL := fmt.Sprintf("https://%s/%s-%sClient.zip", setupURL, latestVersion, year)
+		downloadURL := fmt.Sprintf("https://%s/%s-%sClient-%s.zip", setupURL, latestVersion, year, plat.Key)
 		zipPath, err := downloadClientZip(downloadURL, func(p float32) {
 			onProgress(fmt.Sprintf("Downloading %s client...", year), baseProgress+(p*clientProgress*0.7))
 		})
@@ -531,6 +673,19 @@ func runInstallerLogic(opts LaunchOptions, label *widget.Label, cLoader fyne.Can
 	wg.Add(1)
 	go animateIndeterminate(chunk, loaderWidth, stopAnimation, &wg)
 
+	plat, perr := detectClientPlatform()
+	if perr != nil {
+		fyne.Do(func() {
+			label.SetText(fmt.Sprintf("Error: %v", perr))
+		})
+		return
+	}
+	fmt.Printf("Nekoria bootstrapper %s — native client lane: %s\n", bootstrapperVersion, plat.Key)
+
+	if err := maybeSelfUpdate(plat); err != nil {
+		fmt.Printf("Bootstrapper update check skipped: %v\n", err)
+	}
+
 	appDir, err := getAppDir()
 	if err != nil {
 		fyne.Do(func() {
@@ -574,7 +729,7 @@ func runInstallerLogic(opts LaunchOptions, label *widget.Label, cLoader fyne.Can
 		})
 	}
 
-	if err := checkAndInstallClient(appDir, progressCallback); err != nil {
+	if err := checkAndInstallClient(appDir, plat, progressCallback); err != nil {
 		fyne.Do(func() {
 			label.SetText(fmt.Sprintf("Failed to install client: %v", err))
 		})
@@ -613,7 +768,12 @@ func runInstallerLogic(opts LaunchOptions, label *widget.Label, cLoader fyne.Can
 		fyne.Do(func() {
 			label.SetText("Starting Nekoria...")
 		})
-		if err := launchClient(appDir, opts); err != nil {
+		statusFn := func(msg string) {
+			fyne.Do(func() {
+				label.SetText(msg)
+			})
+		}
+		if err := launchClient(appDir, plat, opts, statusFn); err != nil {
 			fyne.Do(func() {
 				label.SetText(fmt.Sprintf("Failed to launch: %v", err))
 			})
@@ -729,91 +889,84 @@ MimeType=x-scheme-handler/%s;
 		return err
 	}
 
-	go func() {
-		loader, wineEnv := nkWine()
-		for _, v := range []string{"Auto", "ShowCrashDialog"} {
-			cmd := exec.Command(loader, "reg", "add", `HKCU\Software\Wine\Winedbg`,
-				"/v", v, "/t", "REG_DWORD", "/d", "0", "/f")
-			cmd.Env = wineEnv
-			clientlaunchcalls.SetupProcAttr(cmd)
-			if runtime.GOOS == "freebsd" {
-				if dn, derr := os.OpenFile(os.DevNull, os.O_RDWR, 0); derr == nil {
-					cmd.Stdout, cmd.Stderr = dn, dn
-				}
-			}
-			_ = cmd.Run()
-		}
-	}()
-
 	return nil
 }
 
-func nkWineEnv() []string {
-	env := os.Environ()
-	if os.Getenv("WINEPREFIX") == "" {
-		if home, err := os.UserHomeDir(); err == nil {
-			env = append(env, "WINEPREFIX="+filepath.Join(home, ".wine-nekoria"))
-		}
-	}
-	if os.Getenv("WINEDEBUG") == "" {
-		if runtime.GOOS == "freebsd" {
-			env = append(env, "WINEDEBUG=+relay")
-		} else {
-			env = append(env, "WINEDEBUG=-all")
-		}
-	}
-	if runtime.GOOS == "freebsd" && os.Getenv("WINEDLLOVERRIDES") == "" {
-		env = append(env, "WINEDLLOVERRIDES=winedbg.exe=d")
-	}
-	return env
+const placeLauncherPollAttempts = 60
+
+var placeLauncherPollInterval = 2 * time.Second
+
+type placeLauncherResp struct {
+	Status        int    `json:"status"`
+	JoinScriptURL string `json:"joinScriptUrl"`
+	Message       any    `json:"message"`
 }
 
-func healLLVMSymlink(lib, llvm string) {
-	link := filepath.Join(lib, "libLLVM.so.19.1")
-	target := filepath.Join(llvm, "libLLVM.so.19.1")
-	if _, terr := os.Stat(target); terr != nil {
-		return
-	}
-	if cur, lerr := os.Readlink(link); lerr == nil && cur == target {
-		return
-	}
-	_ = os.Remove(link)
-	_ = os.Symlink(target, link)
+func isPlaceLauncherURL(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && strings.Contains(strings.ToLower(u.Path), "placelauncher")
 }
 
-func nkWine() (string, []string) {
-	if runtime.GOOS == "freebsd" && os.Getenv("WINEPREFIX") == "" {
-		if home, err := os.UserHomeDir(); err == nil {
-			root := filepath.Join(home, ".i386-wine-pkg", "usr", "local")
-			lib := filepath.Join(root, "lib")
-			llvm := filepath.Join(root, "llvm19", "lib")
-			loader := filepath.Join(root, "bin", "wine")
-			if _, lerr := os.Stat(loader); lerr == nil {
-				if _, derr := os.Stat(lib); derr == nil {
-					healLLVMSymlink(lib, llvm)
-					env := append(os.Environ(),
-						"WINEPREFIX="+filepath.Join(home, ".i386nekoria11"))
-					if os.Getenv("LD_32_LIBRARY_PATH") == "" {
-						env = append(env, "LD_32_LIBRARY_PATH="+lib+":"+filepath.Join(lib, "pulseaudio")+":"+llvm)
-					}
-					if os.Getenv("LIBGL_DRIVERS_PATH") == "" {
-						env = append(env, "LIBGL_DRIVERS_PATH="+filepath.Join(lib, "dri"))
-					}
-					if os.Getenv("WINEDEBUG") == "" {
-						env = append(env, "WINEDEBUG=-all")
-					}
-					if os.Getenv("WINEDLLOVERRIDES") == "" {
-						env = append(env, "WINEDLLOVERRIDES=winedbg.exe=d")
-					}
-					return loader, env
-				}
+func placeLauncherGet(raw string) (placeLauncherResp, error) {
+	var resp placeLauncherResp
+	var lastErr error
+	for try := 0; try < 3; try++ {
+		r, err := setupHTTPClient.Get(raw)
+		if err != nil {
+			lastErr = err
+			time.Sleep(placeLauncherPollInterval)
+			continue
+		}
+		if r.StatusCode != http.StatusOK {
+			r.Body.Close()
+			return resp, fmt.Errorf("PlaceLauncher returned: %s", r.Status)
+		}
+		err = json.NewDecoder(r.Body).Decode(&resp)
+		r.Body.Close()
+		if err != nil {
+			return resp, fmt.Errorf("invalid PlaceLauncher response: %w", err)
+		}
+		return resp, nil
+	}
+	return resp, fmt.Errorf("PlaceLauncher request failed: %w", lastErr)
+}
+
+func resolveJoinScript(script string, onStatus func(string)) (string, error) {
+	if script == "" {
+		return "", fmt.Errorf("no game start script was provided")
+	}
+	if !isPlaceLauncherURL(script) {
+		return script, nil
+	}
+	for attempt := 1; attempt <= placeLauncherPollAttempts; attempt++ {
+		resp, err := placeLauncherGet(script)
+		if err != nil {
+			return "", err
+		}
+		switch resp.Status {
+		case 2:
+			if resp.JoinScriptURL == "" {
+				return "", fmt.Errorf("PlaceLauncher matched the game but served no join script")
 			}
+			fmt.Printf("Join script: %s\n", resp.JoinScriptURL)
+			return resp.JoinScriptURL, nil
+		case 1:
+			if onStatus != nil {
+				onStatus(fmt.Sprintf("Waiting for the game server to start... (%d)", attempt))
+			}
+			time.Sleep(placeLauncherPollInterval)
+		default:
+			msg, _ := resp.Message.(string)
+			if msg == "" {
+				return "", fmt.Errorf("the game request was rejected (status %d)", resp.Status)
+			}
+			return "", fmt.Errorf("the game request was rejected: %s", msg)
 		}
 	}
-	return "wine", nkWineEnv()
+	return "", fmt.Errorf("timed out waiting for the game server to start")
 }
 
-func launchClient(appDir string, opts LaunchOptions) error {
+func launchClient(appDir string, plat clientPlatform, opts LaunchOptions, onStatus func(string)) error {
 	latestVersion, err := getLatestClientVersion()
 	if err != nil {
 		return fmt.Errorf("failed to get latest version: %w", err)
@@ -825,8 +978,8 @@ func launchClient(appDir string, opts LaunchOptions) error {
 	}
 
 	clientFolder := fmt.Sprintf("Client%s", clientYear)
-	exeName := "NekoriaPlayerBeta.exe"
-	exePath := filepath.Join(appDir, "Versions", latestVersion, clientFolder, exeName)
+	clientDir := filepath.Join(appDir, "Versions", latestVersion, clientFolder)
+	exePath := filepath.Join(clientDir, plat.Exe)
 
 	if _, err := os.Stat(exePath); os.IsNotExist(err) {
 		return fmt.Errorf("client executable not found: %s", exePath)
@@ -834,48 +987,34 @@ func launchClient(appDir string, opts LaunchOptions) error {
 
 	var args []string
 	if opts.LaunchMode == "play" {
-		args = append(args, "--play")
-		args = append(args, "-a", authURLDefault)
-		args = append(args, "-t", opts.AuthTicket)
-		args = append(args, "-j", opts.Script)
+		script, err := resolveJoinScript(opts.Script, onStatus)
+		if err != nil {
+			return err
+		}
+		args = append(args, "--url", script)
 	}
 
 	fmt.Printf("Launching client with command:\n%s %s\n", exePath, strings.Join(args, " "))
 
-	var cmd *exec.Cmd
-	loader := ""
-	if runtime.GOOS == "windows" {
-		cmd = exec.Command(exePath, args...)
-	} else {
-		allArgs := append([]string{exePath}, args...)
-		var wineEnv []string
-		loader, wineEnv = nkWine()
-		cmd = exec.Command(loader, allArgs...)
-		cmd.Env = wineEnv
-	}
+	cmd := exec.Command(exePath, args...)
 	clientlaunchcalls.SetupProcAttr(cmd)
+	cmd.Dir = clientDir
 
-	if runtime.GOOS != "windows" {
-		if old, oerr := filepath.Glob(filepath.Join(appDir, "client-*.log")); oerr == nil && len(old) > 2 {
-			sort.Slice(old, func(i, j int) bool {
-				si, e1 := os.Stat(old[i])
-				sj, e2 := os.Stat(old[j])
-				if e1 != nil || e2 != nil {
-					return false
-				}
-				return si.ModTime().After(sj.ModTime())
-			})
-			for _, p := range old[2:] {
-				os.Remove(p)
+	if old, oerr := filepath.Glob(filepath.Join(appDir, "client-*.log")); oerr == nil && len(old) > 2 {
+		sort.Slice(old, func(i, j int) bool {
+			si, e1 := os.Stat(old[i])
+			sj, e2 := os.Stat(old[j])
+			if e1 != nil || e2 != nil {
+				return false
 			}
+			return si.ModTime().After(sj.ModTime())
+		})
+		for _, p := range old[2:] {
+			os.Remove(p)
 		}
-		if runtime.GOOS == "freebsd" && loader == "wine" {
-			if dn, derr := os.OpenFile(os.DevNull, os.O_RDWR, 0); derr == nil {
-				cmd.Stdout, cmd.Stderr = dn, dn
-			}
-		} else if logf, lerr := os.CreateTemp(appDir, "client-*.log"); lerr == nil {
-			cmd.Stdout, cmd.Stderr = logf, logf
-		}
+	}
+	if logf, lerr := os.CreateTemp(appDir, "client-*.log"); lerr == nil {
+		cmd.Stdout, cmd.Stderr = logf, logf
 	}
 
 	if err := cmd.Start(); err != nil {
